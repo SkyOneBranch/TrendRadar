@@ -19,14 +19,18 @@ RSS 抓取器
    请求返回 469，则保留项目 URL、lssId 和“自动读取受限”状态，
    而不是把该项目整体丢弃。
 
-5. RSSHub 容灾
-   RSSHub 主实例失败时仅尝试一个备用实例；连续 2 个 RSSHub feed
-   均失败后，本轮触发熔断，后续 RSSHub feed 快速跳过，避免单一
-   公共实例故障拖死整个 GitHub Actions 任务。
+5. 微博主备双通道与独立熔断
+   - /weibo/user/<uid>：优先走桌面版 weibo.com/ajax（需 WEIBO_COOKIES），
+     未配置 Cookie 或失败/熔断时自动降级到保留的 rsshub.rss3.workers.dev；
+   - /weibo/keyword/<kw>：优先走桌面版 s.weibo.com（需 WEIBO_COOKIES），
+     未配置 Cookie 或失败/熔断时自动降级到保留的 rsshub.rss3.workers.dev；
+   - RSSHub 主实例失败时仅尝试一个备用实例；weibo_ajax / weibo_search / rsshub
+     三通道各自维护独立熔断，避免单一通道故障拖死整个 GitHub Actions 任务。
 """
 
 import html
 import json
+import os
 import random
 import re
 import time
@@ -41,7 +45,15 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from .parser import RSSParser
+from .parser import ParsedRSSItem, RSSParser
+from .weibo_direct import (
+    WeiboAuthError,
+    WeiboDirectError,
+    extract_weibo_keyword,
+    extract_weibo_user_uid,
+    fetch_weibo_keyword_parsed_items,
+    fetch_weibo_user_parsed_items,
+)
 from trendradar.storage.base import RSSItem, RSSData
 from trendradar.utils.time import get_configured_time, DEFAULT_TIMEZONE
 
@@ -99,6 +111,7 @@ class RSSFetcher:
         "https://rsshub.app/",
     )
     RSSHUB_CIRCUIT_BREAKER_THRESHOLD = 2
+    WEIBO_DIRECT_CIRCUIT_BREAKER_THRESHOLD = 2
 
     TICKET_STRONG_WORDS = (
         "购票",
@@ -207,6 +220,21 @@ class RSSFetcher:
         # RSSHub 熔断状态只在当前进程/当前抓取轮次使用，不做持久化。
         self._rsshub_consecutive_failures = 0
         self._rsshub_circuit_open = False
+
+        # 微博桌面版直连独立熔断状态（用户时间线与关键词搜索分通道隔离）
+        self._weibo_cookies = os.environ.get("WEIBO_COOKIES", "").strip()
+        self._weibo_ajax_consecutive_failures = 0
+        self._weibo_ajax_circuit_open = False
+        self._weibo_search_consecutive_failures = 0
+        self._weibo_search_circuit_open = False
+        self._weibo_auth_expired = False
+        self._channel_stats: Dict[str, int] = {
+            "weibo_ajax": 0,
+            "weibo_search": 0,
+            "rsshub_fallback": 0,
+            "rsshub": 0,
+            "standard_rss": 0,
+        }
 
         self.parser = RSSParser()
         self.session = self._create_session()
@@ -623,6 +651,7 @@ class RSSFetcher:
         feed: RSSFeedConfig,
         title: str,
         summary: str,
+        raw_summary: str = "",
     ) -> bool:
         """
         判断当前条目是否真的属于篮球票务。
@@ -630,17 +659,22 @@ class RSSFetcher:
         不使用 feed.name 参与篮球判断，避免
         “票务专项｜大麦篮球”让普通演唱会自动命中篮球。
         """
+        is_fixed_weibo_user = extract_weibo_user_uid(feed.url) is not None
 
-        _ = feed
-
-        # 篮球属性只看标题/微博正文主体（RSSHub 的 title 通常就是整条微博正文）。
-        # 不使用 summary 做篮球判定，因为部分 keyword RSS 的 summary 可能夹带
-        # feed/query/关联文本，从而让演唱会、足球、网球等条目被“篮球”误命中。
-        title_lower = (title or "").lower()
-        ticket_text_lower = f"{title or ''} {summary or ''}".lower()
+        # 关键词发现源保持严格策略：仅在 title 判定篮球属性，防止 summary 夹带
+        # query/推荐文本误把演唱会、足球、网球判成篮球。
+        # 固定官方 UID 微博源允许联合正文（含展开后的长微博）判断，
+        # 避免超长公告在第 300 字后才出现“CBA/篮球”时漏触发票务外链跟随。
+        body_for_ticket = raw_summary or summary or ""
+        ticket_text_lower = f"{title or ''} {body_for_ticket}".lower()
+        basketball_scope = (
+            ticket_text_lower
+            if is_fixed_weibo_user
+            else (title or "").lower()
+        )
 
         has_basketball = any(
-            word.lower() in title_lower
+            word.lower() in basketball_scope
             for word in self.BASKETBALL_WORDS
         )
 
@@ -1084,6 +1118,7 @@ class RSSFetcher:
             feed,
             title,
             summary,
+            raw_summary=raw_summary,
         ):
             return summary
 
@@ -1174,11 +1209,215 @@ class RSSFetcher:
             f"{appendix}"
         )
 
-    def fetch_feed(
+    def _effective_max_age_days(self, feed: RSSFeedConfig) -> Optional[int]:
+        if feed.max_age_days is not None:
+            return feed.max_age_days
+        return self.default_max_age_days
+
+    def _can_use_weibo_user_direct(self, feed: RSSFeedConfig) -> bool:
+        return bool(
+            extract_weibo_user_uid(feed.url)
+            and self._weibo_cookies
+            and not self._weibo_ajax_circuit_open
+            and not self._weibo_auth_expired
+        )
+
+    def _can_use_weibo_keyword_direct(self, feed: RSSFeedConfig) -> bool:
+        return bool(
+            not extract_weibo_user_uid(feed.url)
+            and extract_weibo_keyword(feed.url)
+            and self._weibo_cookies
+            and not self._weibo_search_circuit_open
+            and not self._weibo_auth_expired
+        )
+
+    def _is_feed_fully_circuit_open(self, feed: RSSFeedConfig) -> bool:
+        """判断当前 feed 的全部可用通道是否均已熔断（跳过无效 sleep 与请求）。"""
+        if not self._is_rsshub_url(feed.url):
+            return False
+        if not self._rsshub_circuit_open:
+            return False
+        return (
+            not self._can_use_weibo_user_direct(feed)
+            and not self._can_use_weibo_keyword_direct(feed)
+        )
+
+    def _build_items_from_parsed(
+        self,
+        feed: RSSFeedConfig,
+        parsed_items: List[ParsedRSSItem],
+    ) -> Tuple[List[RSSItem], int]:
+        """统一后处理：max_items、白名单过滤、日期兜底、票务专项过滤、ticket_enrich、构造 RSSItem。"""
+        if feed.max_items > 0:
+            parsed_items = parsed_items[:feed.max_items]
+
+        now = get_configured_time(self.timezone)
+        crawl_time = now.strftime("%H:%M")
+
+        items: List[RSSItem] = []
+        author_filtered = 0
+
+        for parsed in parsed_items:
+            if not self._author_allowed(
+                feed,
+                parsed.author or "",
+            ):
+                author_filtered += 1
+
+                print(
+                    f"[RSS作者过滤] {feed.name}: "
+                    f"拒绝 author={parsed.author!r}, "
+                    f"title={(parsed.title or '')[:60]!r}"
+                )
+                continue
+
+            clean_summary = parsed.summary or ""
+
+            # ============================================
+            # 微博 keyword discovery 正文日期兜底
+            # ============================================
+
+            should_drop_old, explicit_date = (
+                self._should_drop_old_keyword_discovery_item(
+                    feed=feed,
+                    title=parsed.title or "",
+                    summary=clean_summary,
+                    published_at=parsed.published_at or "",
+                )
+            )
+
+            if should_drop_old:
+                print(
+                    f"[微博日期过滤] {feed.name}: "
+                    f"正文最新明确日期={explicit_date}, "
+                    f"超过 max_age_days={feed.max_age_days}, "
+                    f"丢弃 -> {(parsed.title or '')[:80]}"
+                )
+                continue
+
+            # ============================================
+            # 票务专项 discovery：非篮球票务整条丢弃
+            # ============================================
+
+            if (
+                self._is_strict_ticket_discovery_feed(feed)
+                and not self._is_ticket_context(
+                    feed,
+                    parsed.title or "",
+                    clean_summary,
+                )
+            ):
+                print(
+                    f"[票务专项过滤] {feed.name}: "
+                    f"非篮球票务，整条丢弃 -> "
+                    f"{(parsed.title or '')[:80]}"
+                )
+                continue
+
+            raw_summary = (
+                getattr(
+                    parsed,
+                    "raw_summary",
+                    None,
+                )
+                or clean_summary
+            )
+
+            enriched_summary = self._enrich_ticket_summary(
+                feed=feed,
+                title=parsed.title or "",
+                summary=clean_summary,
+                raw_summary=raw_summary,
+            )
+
+            item = RSSItem(
+                title=parsed.title,
+                feed_id=feed.id,
+                feed_name=feed.name,
+                url=parsed.url,
+                guid=parsed.guid or parsed.url or "",
+                published_at=parsed.published_at or "",
+                summary=enriched_summary,
+                author=parsed.author or "",
+                crawl_time=crawl_time,
+                first_time=crawl_time,
+                last_time=crawl_time,
+                count=1,
+            )
+
+            items.append(item)
+
+        return items, author_filtered
+
+    def _record_rsshub_result(self, feed: RSSFeedConfig, failed: bool) -> None:
+        if failed:
+            self._rsshub_consecutive_failures += 1
+
+            print(
+                f"[RSS熔断] {feed.name}: "
+                "RSSHub 连续失败计数="
+                f"{self._rsshub_consecutive_failures}/"
+                f"{self.RSSHUB_CIRCUIT_BREAKER_THRESHOLD}"
+            )
+
+            if (
+                self._rsshub_consecutive_failures
+                >= self.RSSHUB_CIRCUIT_BREAKER_THRESHOLD
+            ):
+                self._rsshub_circuit_open = True
+
+                print(
+                    "[RSS熔断] RSSHub 已连续失败 "
+                    f"{self._rsshub_consecutive_failures} 个源，"
+                    "本轮停止请求其余 RSSHub 备通道；"
+                    "微博直连主通道、其他 RSS 与后续 AI/推送流程继续"
+                )
+        else:
+            if self._rsshub_consecutive_failures > 0:
+                print(
+                    f"[RSS熔断] {feed.name}: "
+                    "RSSHub 请求恢复，连续失败计数归零"
+                )
+            self._rsshub_consecutive_failures = 0
+
+    def _record_weibo_direct_failure(
+        self,
+        channel: str,
+        feed: RSSFeedConfig,
+        exc: Exception,
+    ) -> None:
+        is_auth = isinstance(exc, WeiboAuthError)
+        if is_auth:
+            self._weibo_auth_expired = True
+
+        if channel == "weibo_ajax":
+            self._weibo_ajax_consecutive_failures += 1
+            count = self._weibo_ajax_consecutive_failures
+            if is_auth or count >= self.WEIBO_DIRECT_CIRCUIT_BREAKER_THRESHOLD:
+                self._weibo_ajax_circuit_open = True
+                if is_auth:
+                    self._weibo_search_circuit_open = True
+                print(
+                    f"[微博直连熔断] {feed.name}: weibo_ajax 本轮触发熔断 "
+                    f"(auth_expired={is_auth}, count={count}) -> 后续自动降级 RSSHub"
+                )
+        else:
+            self._weibo_search_consecutive_failures += 1
+            count = self._weibo_search_consecutive_failures
+            if is_auth or count >= self.WEIBO_DIRECT_CIRCUIT_BREAKER_THRESHOLD:
+                self._weibo_search_circuit_open = True
+                if is_auth:
+                    self._weibo_ajax_circuit_open = True
+                print(
+                    f"[微博直连熔断] {feed.name}: weibo_search 本轮触发熔断 "
+                    f"(auth_expired={is_auth}, count={count}) -> 后续自动降级 RSSHub"
+                )
+
+    def _fetch_via_http_rss(
         self,
         feed: RSSFeedConfig,
     ) -> Tuple[List[RSSItem], Optional[str]]:
-        """抓取单个 RSS 源"""
+        """既有 HTTP RSS / RSSHub 抓取路径。"""
 
         try:
             response = self._request_feed_response(feed)
@@ -1212,104 +1451,10 @@ class RSSFetcher:
                 feed.url,
             )
 
-            if feed.max_items > 0:
-                parsed_items = parsed_items[:feed.max_items]
-
-            now = get_configured_time(self.timezone)
-            crawl_time = now.strftime("%H:%M")
-
-            items: List[RSSItem] = []
-            author_filtered = 0
-
-            for parsed in parsed_items:
-                if not self._author_allowed(
-                    feed,
-                    parsed.author or "",
-                ):
-                    author_filtered += 1
-
-                    print(
-                        f"[RSS作者过滤] {feed.name}: "
-                        f"拒绝 author={parsed.author!r}, "
-                        f"title={(parsed.title or '')[:60]!r}"
-                    )
-                    continue
-
-                clean_summary = parsed.summary or ""
-
-                # ============================================
-                # 微博 keyword discovery 正文日期兜底
-                # ============================================
-
-                should_drop_old, explicit_date = (
-                    self._should_drop_old_keyword_discovery_item(
-                        feed=feed,
-                        title=parsed.title or "",
-                        summary=clean_summary,
-                        published_at=parsed.published_at or "",
-                    )
-                )
-
-                if should_drop_old:
-                    print(
-                        f"[微博日期过滤] {feed.name}: "
-                        f"正文最新明确日期={explicit_date}, "
-                        f"超过 max_age_days={feed.max_age_days}, "
-                        f"丢弃 -> {(parsed.title or '')[:80]}"
-                    )
-                    continue
-
-                # ============================================
-                # 票务专项 discovery：非篮球票务整条丢弃
-                # ============================================
-
-                if (
-                    self._is_strict_ticket_discovery_feed(feed)
-                    and not self._is_ticket_context(
-                        feed,
-                        parsed.title or "",
-                        clean_summary,
-                    )
-                ):
-                    print(
-                        f"[票务专项过滤] {feed.name}: "
-                        f"非篮球票务，整条丢弃 -> "
-                        f"{(parsed.title or '')[:80]}"
-                    )
-                    continue
-
-                raw_summary = (
-                    getattr(
-                        parsed,
-                        "raw_summary",
-                        None,
-                    )
-                    or clean_summary
-                )
-
-                enriched_summary = self._enrich_ticket_summary(
-                    feed=feed,
-                    title=parsed.title or "",
-                    summary=clean_summary,
-                    raw_summary=raw_summary,
-                )
-
-                item = RSSItem(
-                    title=parsed.title,
-                    feed_id=feed.id,
-                    feed_name=feed.name,
-                    url=parsed.url,
-                    guid=parsed.guid or "",
-                    published_at=parsed.published_at or "",
-                    summary=enriched_summary,
-                    author=parsed.author or "",
-                    crawl_time=crawl_time,
-                    first_time=crawl_time,
-                    last_time=crawl_time,
-                    count=1,
-                )
-
-                items.append(item)
+            items, author_filtered = self._build_items_from_parsed(
+                feed,
+                parsed_items,
+            )
 
             extra = ""
 
@@ -1354,6 +1499,137 @@ class RSSFetcher:
             print(f"[RSS] {feed.name}: {error}")
             return [], error
 
+    def fetch_feed(
+        self,
+        feed: RSSFeedConfig,
+    ) -> Tuple[List[RSSItem], Optional[str]]:
+        """
+        抓取单个 RSS 源（微博源采用同 feed_id 主备双通道）：
+        - /weibo/user/<uid>   ：主通道 weibo.com/ajax -> 失败/无 Cookie 自动降级 RSSHub
+        - /weibo/keyword/<kw> ：主通道 s.weibo.com    -> 失败/无 Cookie 自动降级 RSSHub
+        - 普通 RSS            ：直接 HTTP 抓取
+        """
+
+        weibo_uid = extract_weibo_user_uid(feed.url)
+        weibo_kw = None if weibo_uid else extract_weibo_keyword(feed.url)
+        is_weibo_dual = bool(weibo_uid or weibo_kw)
+        is_rsshub = self._is_rsshub_url(feed.url)
+
+        primary_error: Optional[str] = None
+
+        # ---- 1. 主通道：微博桌面版直连 ----
+        if weibo_uid and self._can_use_weibo_user_direct(feed):
+            try:
+                parsed_items = fetch_weibo_user_parsed_items(
+                    session=self.session,
+                    uid=weibo_uid,
+                    feed_name=feed.name,
+                    cookies=self._weibo_cookies,
+                    timeout=self.timeout,
+                    max_items=feed.max_items,
+                    freshness_enabled=self.freshness_enabled,
+                    max_age_days=self._effective_max_age_days(feed),
+                    timezone=self.timezone,
+                    max_summary_length=self.parser.max_summary_length,
+                )
+                self._weibo_ajax_consecutive_failures = 0
+                items, author_filtered = self._build_items_from_parsed(
+                    feed,
+                    parsed_items,
+                )
+                self._channel_stats["weibo_ajax"] = (
+                    self._channel_stats.get("weibo_ajax", 0) + 1
+                )
+                extra = (
+                    f", 官方作者过滤后保留 {len(items)} 条, 丢弃 {author_filtered} 条"
+                    if feed.allowed_authors
+                    else ""
+                )
+                print(
+                    f"[RSS/weibo_ajax] {feed.name}: "
+                    f"直连获取 {len(items)} 条 (uid={weibo_uid}{extra})"
+                )
+                return items, None
+            except (WeiboDirectError, requests.RequestException, Exception) as exc:
+                primary_error = f"weibo_ajax 失败: {exc}"
+                print(
+                    f"[RSS/weibo_ajax] {feed.name}: {primary_error}，降级 RSSHub 备通道"
+                )
+                self._record_weibo_direct_failure("weibo_ajax", feed, exc)
+
+        elif weibo_kw and self._can_use_weibo_keyword_direct(feed):
+            try:
+                parsed_items = fetch_weibo_keyword_parsed_items(
+                    session=self.session,
+                    keyword=weibo_kw,
+                    cookies=self._weibo_cookies,
+                    timeout=self.timeout,
+                    max_items=feed.max_items,
+                    timezone=self.timezone,
+                    max_summary_length=self.parser.max_summary_length,
+                )
+                self._weibo_search_consecutive_failures = 0
+                items, author_filtered = self._build_items_from_parsed(
+                    feed,
+                    parsed_items,
+                )
+                self._channel_stats["weibo_search"] = (
+                    self._channel_stats.get("weibo_search", 0) + 1
+                )
+                extra = (
+                    f", 官方作者过滤后保留 {len(items)} 条, 丢弃 {author_filtered} 条"
+                    if feed.allowed_authors
+                    else ""
+                )
+                print(
+                    f"[RSS/weibo_search] {feed.name}: "
+                    f"直连获取 {len(items)} 条 (q={weibo_kw!r}{extra})"
+                )
+                return items, None
+            except (WeiboDirectError, requests.RequestException, Exception) as exc:
+                primary_error = f"weibo_search 失败: {exc}"
+                print(
+                    f"[RSS/weibo_search] {feed.name}: {primary_error}，降级 RSSHub 备通道"
+                )
+                self._record_weibo_direct_failure("weibo_search", feed, exc)
+
+        # ---- 2. 备通道（或普通 RSS）：走保留的 rsshub.rss3.workers.dev / 原 URL ----
+        if is_rsshub and self._rsshub_circuit_open:
+            skip_msg = "RSSHub 备通道本轮已熔断，跳过网络请求"
+            print(f"[RSS熔断] {feed.name}: {skip_msg}")
+            return (
+                [],
+                f"{primary_error}; {skip_msg}" if primary_error else skip_msg,
+            )
+
+        items, fallback_error = self._fetch_via_http_rss(feed)
+
+        if is_rsshub:
+            self._record_rsshub_result(feed, failed=bool(fallback_error))
+
+        if fallback_error:
+            combined = (
+                f"{primary_error}; {fallback_error}"
+                if primary_error
+                else fallback_error
+            )
+            return [], combined
+
+        if is_weibo_dual:
+            self._channel_stats["rsshub_fallback"] = (
+                self._channel_stats.get("rsshub_fallback", 0) + 1
+            )
+        elif is_rsshub:
+            self._channel_stats["rsshub"] = (
+                self._channel_stats.get("rsshub", 0) + 1
+            )
+        else:
+            self._channel_stats["standard_rss"] = (
+                self._channel_stats.get("standard_rss", 0) + 1
+            )
+
+        return items, None
+
     def fetch_all(self) -> RSSData:
         """抓取所有 RSS 源"""
 
@@ -1370,18 +1646,29 @@ class RSSFetcher:
             f"{len(self.feeds)} 个 RSS 源..."
         )
 
-        # 每次 fetch_all() 都重新开始一轮熔断状态。
+        # 每次 fetch_all() 都重新开始一轮三通道熔断与统计状态。
         self._rsshub_consecutive_failures = 0
         self._rsshub_circuit_open = False
+        self._weibo_ajax_consecutive_failures = 0
+        self._weibo_ajax_circuit_open = False
+        self._weibo_search_consecutive_failures = 0
+        self._weibo_search_circuit_open = False
+        self._weibo_auth_expired = False
+        self._channel_stats = {
+            "weibo_ajax": 0,
+            "weibo_search": 0,
+            "rsshub_fallback": 0,
+            "rsshub": 0,
+            "standard_rss": 0,
+        }
 
         for index, feed in enumerate(self.feeds):
             id_to_name[feed.id] = feed.name
-            is_rsshub = self._is_rsshub_url(feed.url)
 
-            if self._rsshub_circuit_open and is_rsshub:
+            if self._is_feed_fully_circuit_open(feed):
                 print(
                     f"[RSS熔断] {feed.name}: "
-                    "RSSHub 本轮已熔断，跳过网络请求"
+                    "主备通道本轮均已熔断，跳过网络请求"
                 )
                 failed_ids.append(feed.id)
                 continue
@@ -1392,39 +1679,6 @@ class RSSFetcher:
                 time.sleep(max(0, interval + jitter))
 
             items, error = self.fetch_feed(feed)
-
-            if is_rsshub:
-                if error:
-                    self._rsshub_consecutive_failures += 1
-
-                    print(
-                        f"[RSS熔断] {feed.name}: "
-                        "RSSHub 连续失败计数="
-                        f"{self._rsshub_consecutive_failures}/"
-                        f"{self.RSSHUB_CIRCUIT_BREAKER_THRESHOLD}"
-                    )
-
-                    if (
-                        self._rsshub_consecutive_failures
-                        >= self.RSSHUB_CIRCUIT_BREAKER_THRESHOLD
-                    ):
-                        self._rsshub_circuit_open = True
-
-                        print(
-                            "[RSS熔断] RSSHub 已连续失败 "
-                            f"{self._rsshub_consecutive_failures} 个源，"
-                            "本轮停止请求其余 RSSHub feed；"
-                            "其他 RSS 与后续 AI/推送流程继续"
-                        )
-
-                else:
-                    if self._rsshub_consecutive_failures > 0:
-                        print(
-                            f"[RSS熔断] {feed.name}: "
-                            "RSSHub 请求恢复，连续失败计数归零"
-                        )
-
-                    self._rsshub_consecutive_failures = 0
 
             if error:
                 failed_ids.append(feed.id)
@@ -1442,6 +1696,15 @@ class RSSFetcher:
             f"{len(failed_ids)} 个失败, "
             f"共 {total_items} 条"
         )
+        print(
+            "[RSS通道] "
+            + ", ".join(f"{k}={v}" for k, v in self._channel_stats.items())
+        )
+        if self._weibo_auth_expired:
+            print(
+                "[RSS告警] WEIBO_AUTH_EXPIRED: 微博桌面版 Cookie 已失效或触发登录验证，"
+                "已自动降级至 RSSHub 备通道，请尽快更新 GitHub Secret WEIBO_COOKIES"
+            )
 
         if failed_ids:
             print(

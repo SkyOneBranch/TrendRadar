@@ -181,9 +181,8 @@ rss:
     # 目标：
     # keyword 搜索 → 官方账号固定源
     #
-    # 17队使用 numeric UID。
-    # 山东、山西、宁波当前使用 keyword + author精确白名单，
-    # 不接受其他媒体/球迷账号。
+    # 全部20队统一使用官方账号 numeric UID，
+    # 主通道走 weibo.com/ajax 直连，备通道保留 rsshub.rss3.workers.dev。
     # ==========================================================
 
     # 1 辽宁沈阳三生飞豹
@@ -325,15 +324,11 @@ rss:
       ticket_enrich: true
 
     # 18 宁波富邦
-    # 当前无法安全确认 numeric UID，因此仅接受官方作者。
     - id: "cba-ningbo"
       name: "宁波富邦町渥男篮"
-      url: "https://rsshub.rss3.workers.dev/weibo/keyword/宁波富邦町渥男篮"
+      url: "https://rsshub.rss3.workers.dev/weibo/user/7557035780"
       max_age_days: 2
       max_items: 10
-      allowed_authors:
-        - "宁波富邦町渥男篮"
-        - "宁波富邦男篮俱乐部"
       ticket_enrich: true
 
     # 19 四川蓝鲸
@@ -523,12 +518,6 @@ display:
       - "cba-official"
       - "wcba-official"
       - "nbl-official"
-
-      - "damai-basketball"
-      - "damai-cba"
-      - "damai-china-men"
-      - "damai-wcba"
-      - "damai-nbl"
 
     max_items: 50
 
