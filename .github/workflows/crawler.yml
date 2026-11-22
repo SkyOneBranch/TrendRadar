@@ -171,6 +171,8 @@ jobs:
           S3_SECRET_ACCESS_KEY: ${{ secrets.S3_SECRET_ACCESS_KEY }}
           S3_ENDPOINT_URL: ${{ secrets.S3_ENDPOINT_URL }}
           S3_REGION: ${{ secrets.S3_REGION }}
+          # 微博桌面版直连主通道（未配置或失效时自动降级至 RSSHub 备通道）
+          WEIBO_COOKIES: ${{ secrets.WEIBO_COOKIES }}
           GITHUB_ACTIONS: true
         run: uv run python -m trendradar
 
